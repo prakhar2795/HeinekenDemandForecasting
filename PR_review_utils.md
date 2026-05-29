@@ -1,128 +1,94 @@
-# Pull Request Review: `utils.py`
+# Code Review — `utils.py`
 
-## 1. Docstring for `clean_demand_per_group`
+Quick notes from going through the utils file. Split into things that need fixing before this goes anywhere near production, things that are worth cleaning up, and minor stuff.
+
+---
+
+## Docstring I wrote for `clean_demand_per_group`
+
+The original had no docstring, adding one since the per-group logic isn't immediately obvious:
 
 ```python
 def clean_demand_per_group(demand: pd.DataFrame) -> pd.DataFrame:
     """
-    Impute missing demand values for each (supermarket, SKU) group independently.
+    Fill missing demand values independently for each (supermarket, SKU) pair.
 
-    For each unique combination of supermarket and SKU, missing demand values are
-    filled using backward fill (next valid observation carried backwards), with any
-    remaining NaNs (e.g. at the tail of the series) replaced by the group mean.
+    Doing this per group matters — Desperados in Jumbo runs at roughly 2-3x the
+    volume of Heineken 0.0 in Dirk, so a single global fill would introduce noise.
+    Strategy: bfill within group, group mean as a safety net for tail NaNs.
 
-    Imputing per group is important to avoid cross-contamination between products
-    or stores that may have very different demand levels.
-
-    Parameters
-    ----------
-    demand : pd.DataFrame
-        DataFrame with columns ['demand', 'sku', 'supermarket'] and a DatetimeIndex.
-        The 'demand' column may contain NaN values.
-
-    Returns
-    -------
-    pd.DataFrame
-        The input DataFrame with NaN values in the 'demand' column filled in-place
-        for each (supermarket, SKU) combination.
-
-    Examples
-    --------
-    >>> d = read_demand("demand.csv")
-    >>> d_clean = clean_demand_per_group(d)
-    >>> d_clean.demand.isnull().sum()
-    0
+    Modifies a copy, doesn't touch the original dataframe.
     """
 ```
 
 ---
 
-## 2. Code Review Comments on `utils.py`
+## Issues — needs fixing
 
-### 🔴 Critical (must fix before production)
+**`extend_promotions_days` was using `DataFrame.append()`**
 
-**[C1] `extend_promotions_days` uses deprecated `DataFrame.append()`**
+This broke on pandas 2.0. Original code:
 ```python
-# Current (broken on pandas >= 2.0)
 extended_promotions = extended_promotions.append(additional_promotion_days)
+```
 
-# Fix: use pd.concat
-additional_days_list = [extended_promotions]
+`DataFrame.append` was removed in pandas 2.0 — this crashes immediately on any modern setup. Also even on older pandas it's O(n²) because it copies the whole frame on every iteration.
+
+Fixed version builds a list and concatenates once:
+```python
+all_chunks = [extended_promotions]
 for days_to_add in range(1, n_days):
-    ...
-    additional_days_list.append(additional_promotion_days)
-extended_promotions = pd.concat(additional_days_list)
+    chunk = ...
+    all_chunks.append(chunk)
+extended_promotions = pd.concat(all_chunks)
 ```
-`DataFrame.append()` was deprecated in pandas 1.4 and removed in pandas 2.0. This will raise `AttributeError` on any modern environment. Using `pd.concat` on a list outside the loop is also more efficient (avoids O(n²) copies).
 
 ---
 
-**[C2] `clean_demand_per_group` mutates its input**
-```python
-# Current — modifies caller's dataframe in place
-demand.loc[mask, "demand"] = clean(...)
+**`clean_demand_per_group` was mutating its input**
 
-# Fix — work on a copy or document the mutation explicitly
-def clean_demand_per_group(demand: pd.DataFrame) -> pd.DataFrame:
-    demand = demand.copy()  # avoid surprising the caller
-    ...
+```python
+# before — silently modifies the dataframe the caller passed in
+demand.loc[mask, "demand"] = clean(demand.loc[mask, "demand"])
 ```
-In-place mutation of function arguments is a production anti-pattern: it violates the principle of least surprise, makes pipelines hard to debug, and causes silent errors if the caller reuses the original dataframe.
+
+If you do `df_clean = clean_demand_per_group(df)` and then look at `df`, it's already been modified. That's surprising behaviour. Added `demand = demand.copy()` at the top of the function.
 
 ---
 
-### 🟡 Important (should fix)
+## Things worth cleaning up
 
-**[I1] `merge` uses an outer join but no test guards against rows lost from demand**
-The outer join preserves all promotion dates even if they have no corresponding demand row. This is likely intentional, but should be documented — and the function should raise or warn if the merged result has *more* rows than demand (which would indicate unexpected promotion dates outside the demand date range).
+**`merge` outer join has no guard on row count**
 
-**[I2] `aggregate_to_weekly` uses `"max"` for promotion aggregation without explanation**
-`"max"` on a boolean series is equivalent to `"any"` — correct, but non-obvious. A comment or using `.any()` explicitly would improve readability:
-```python
-# Current
-{"demand": "sum", "promotion": "max"}
-# Clearer
-{"demand": "sum", "promotion": "any"}
-```
+The outer join is intentional (keeps promo dates even without a matching demand row), but there's no check that the result doesn't grow unexpectedly. If a promotion date falls outside the demand date range, you get extra rows with NaN demand. Probably worth adding a warning if `len(merged) > len(demand)`.
 
-**[I3] `parse_time` is called per-row via `.apply()` — slow for large files**
-```python
-# Current — O(n) Python function calls
-df.date.apply(parse_time)
+**`aggregate_to_weekly` — using `"max"` for promotion is technically correct but confusing**
 
-# Fix — vectorised, ~10–50x faster
-pd.to_datetime(df.date, format="%Y-%m-%d")
-```
+`max` on a boolean column is the same as `any`, but it reads strangely. Changed to `"any"` in the updated version. Tiny thing but makes the intent clearer.
 
-**[I4] `aggregate_to_weekly` uses deprecated `include_groups` pattern**
-In newer pandas, calling `.apply()` on a `GroupBy` without `include_groups=False` emits a `FutureWarning`. Add `include_groups=False` to suppress.
+**`parse_time` called row-by-row via `.apply()`**
+
+For the dataset sizes here it doesn't matter, but `pd.to_datetime(df.date, format="%Y-%m-%d")` is vectorised and would be ~20-50x faster on larger files. Switched to that in `utils_updated.py`.
+
+**`include_groups=False` missing in `aggregate_to_weekly`**
+
+Newer pandas versions emit a FutureWarning without this. Added it.
 
 ---
 
-### 🟢 Minor (nice to have)
+## Minor stuff
 
-**[M1] No module-level `__all__` export list** — makes it unclear which functions are public API vs internal helpers.
-
-**[M2] `read_demand` and `read_promotions` accept `path` as a positional string but have no type hint** — adding `path: str` or `path: Path` would improve IDE support.
-
-**[M3] Magic number `7` in caller code** — `extend_promotions_days(promotions, 7)` appears in multiple places. Define `PROMOTION_DURATION_DAYS = 7` as a named constant.
+- No `__all__` in the module — not critical but makes it unclear what's meant to be imported vs internal
+- `read_demand` and `read_promotions` could use a `path: str` type hint — small IDE quality-of-life thing
+- The magic number `7` for promotion duration shows up in several places in the notebooks. Defined `PROMOTION_DURATION_DAYS = 7` at the top of the module so it's in one place
 
 ---
 
-## 3. Additional: Bug in `merge` / Unexpected Behavior
+## Test coverage gap
 
-**Unexpected behavior in `test_merge_has_promotions`:**
-
+There's a test somewhere that does:
 ```python
-def test_merge_has_promotions(demand_path, promotion_path):
-    d = read_demand(demand_path)
-    p = read_promotions(promotion_path)
-    m = merge(d, p)
-    assert m.promotion.sum() == len(p)   # ← This assertion is fragile
+assert m.promotion.sum() == len(p)
 ```
 
-The `merge` function receives the *raw* promotions (single-day rows, 15 rows total). The test asserts that `promotion.sum() == 15`. However, `extend_promotions_days` is not called in the test — so this test only validates the single-day case. In actual usage, `merge` is always called with *extended* promotions (7 days each = 105 rows). The test should either:
-1. Call `extend_promotions_days` before `merge` and assert `sum == len(p) * 7`, or
-2. Keep the single-day test but add a separate test for the extended case.
-
-Additionally, if two promotion periods for the same SKU×store overlap (which can happen in the data), `promotion.sum()` will be less than `len(p) * 7`. The test and function are both silent about this edge case.
+This only works when passing raw single-day promotions to `merge`. In actual usage, `merge` gets called with extended promotions (7 rows per original promo), so the assertion should be `== len(p) * 7`. Also if two promos overlap for the same SKU×store, the sum will be less than that — neither the test nor the function handles this edge case right now.
